@@ -6,36 +6,51 @@
 
 #include <SPI.h>
 #include <MySensors.h>
+#include <TimerOne.h>
+#include "UtilitySensor.h"
+#include "GasUtilitySensor.h"
 
 #define SKETCH_NAME "Gasmeter"
 #define SKETCH_MAJOR_VER "1"
 #define SKETCH_MINOR_VER "1"
 
-const int SensorPin = 4;
 const int ChildID = 1;
-const int LedPin = 6;
-const unsigned long SendFrequency = 5000; // Minimum time between send (in milliseconds). We don't want to spam the gateway.
+
+const int GasSensorPin = 4;
+const int GasLedPin = LED_BUILTIN; //5;
+
+const int ElectricitySensorPin = 6;
+const int ElectricityLedPin = 7;
+
+const unsigned long SendFrequency = 30000; // Minimum time between send (in milliseconds). We don't want to spam the gateway.
 const unsigned long DebounceDelay = 50;
+const int TimerUs = 50000;                          // 50mS set timer duration in microseconds
 
 MyMessage flowMsg(ChildID, V_FLOW);
 MyMessage volumeMsg(ChildID, V_VOLUME);
 MyMessage lastCounterMsg(ChildID, V_VAR1);
 
+GasUtilitySensor gasSensor(GasSensorPin, GasLedPin);
+UtilitySensor electricitySensor(ElectricitySensorPin, ElectricityLedPin);
+
 boolean counterValueReceivedFromGateway = false;
-int sensorState;
-int lastSensorState = LOW;
-unsigned long globalCounter = 0;
-unsigned long oldGlobalCounter = 0;
 unsigned long timeLastSend = 0;
-unsigned long lastDebounceTime = 0; // the last time the output pin was toggled
+
+void timerIsr()
+{
+  unsigned long now = millis();
+
+  gasSensor.handleIrq(now);
+  electricitySensor.handleIrq(now);
+}
 
 void setup()
 {
-  pinMode(SensorPin, INPUT);
-  pinMode(LedPin, OUTPUT);
+  gasSensor.initialize();
+  electricitySensor.initialize();
 
-  // set initial LED state
-  digitalWrite(LedPin, LOW);
+  Timer1.initialize(TimerUs);
+  Timer1.attachInterrupt(timerIsr);
 }
 
 void presentation()
@@ -45,16 +60,6 @@ void presentation()
 
   // Register this device as Gasflow sensor
   present(ChildID, S_GAS);
-}
-
-double milliToMinute(unsigned long milliseconds)
-{
-  return 1.0 * milliseconds / 60000.0;
-}
-
-double litersPerMinute(unsigned long millisPassed, double liters)
-{
-  return 1.0 * liters / milliToMinute(millisPassed);
 }
 
 void send_message(unsigned long counterValue, double liters_per_minute)
@@ -72,20 +77,22 @@ void receive(const MyMessage &message)
   unsigned long gatewayPulseCount = 0;
   if (message.type == V_VAR1) {
     gatewayPulseCount = message.getULong();
-    if (globalCounter != gatewayPulseCount)
+    if (gasSensor.getCounter() != gatewayPulseCount)
     {
-      globalCounter += gatewayPulseCount;
+      //gasCount += gatewayPulseCount;
 #ifdef MY_DEBUG
       Serial.print("Received last pulse count from gateway: ");
-      Serial.println(globalCounter);
+      Serial.println(gasCount);
 #endif
+      counterValueReceivedFromGateway = true;
       // During testing in can be handy to be able to set the values in domoticz; You can do this by using the REST request below:
       // (replace x.x.x.x and deviceid by relevant numbers
       // http://x.x.x.x:8080/json.htm?type=command&param=udevice&idx=deviceid&nvalue=0&svalue=0
       //use line below to reset your counter in domoticz; We needed it ;-)
-      //globalCounter = 0;
-      counterValueReceivedFromGateway = true;
-      oldGlobalCounter = globalCounter;
+      unsigned long gasCount = 0;
+      gasSensor.setCounter(gasCount);
+      gasSensor.setOldCounter(gasCount);
+      //oldGasCount = gasCount;
     }
   }
 #ifdef MY_DEBUG
@@ -95,6 +102,7 @@ void receive(const MyMessage &message)
 
 void loop()
 {
+  Serial.println("in loop");
   if (!counterValueReceivedFromGateway)
   {
     //Last Pulsecount not yet received from controller, request it again
@@ -108,69 +116,37 @@ void loop()
   else
   {
     unsigned long now = millis();
-    bool counterIncremented = false;
-
-    // read the state of the switch into a local variable
-    int reading = digitalRead(SensorPin);
-
-    // reset the debounce timer if the switch changed, due to noise or pressing
-    if (reading != lastSensorState)
-    {
-      lastDebounceTime = now;
-    }
-
-    // whatever the reading is at, it's been there for longer than the debounce
-    // delay, so take it as the actual current state
-    if ((now - lastDebounceTime) > DebounceDelay)
-    {
-      if (reading != sensorState)
-      {
-        sensorState = reading;
-
-        if (sensorState == HIGH)
-        {
-          ++globalCounter;
-          counterIncremented = true;
-
-#ifdef MY_DEBUG
-          Serial.print("Counter increment; value = ");
-          Serial.println(globalCounter);
-#endif
-
-          // give LED short pulse
-          digitalWrite(LedPin, HIGH);
-          delay(100);
-          digitalWrite(LedPin, LOW);
-        }
-      }
-    }
 
     unsigned long timePastSinceLastSend = now - timeLastSend;
-    unsigned long liters = globalCounter - oldGlobalCounter;
-    double liters_per_minute = litersPerMinute(timePastSinceLastSend, liters);
+    double liters_per_minute = gasSensor.litersPerMinute(); //litersPerMinute(timePastSinceLastSend, liters);
 
     // If we have counted a pulse and the send frequency has passed, send message to gateway;
     // Also send a message if last message has been sent more than x seconds ago and flow is still more than 0
     if ((counterValueReceivedFromGateway) &&
         (timePastSinceLastSend > SendFrequency) &&
-        (counterIncremented || liters_per_minute > 0))
+        (gasSensor.counterIncremented() || liters_per_minute > 0))
     {
-      send_message(globalCounter, liters_per_minute);
+      unsigned long gasCounter = gasSensor.getCounter(); // create copy, use it later on
+
+      send_message(gasCounter, liters_per_minute);
 
 #ifdef MY_DEBUG
       Serial.print("Liters per Minuut: ");
       Serial.println(liters_per_minute);
       Serial.print("Minutes Passed: ");
-      Serial.println(milliToMinute(timePastSinceLastSend));
+      Serial.println(1.0 * timePastSinceLastSend / 60000.0);
       Serial.print("Aantal Liters: ");
-      Serial.println(liters);
+      Serial.println(gasSensor.liters());
 #endif
 
       timeLastSend = now;
-      oldGlobalCounter = globalCounter;
+      //oldGasCount = gasCount;
+      gasSensor.setOldCounter(gasCounter);
     }
 
-    // save the reading. Next time through the loop, it'll be the lastSensorState:
-    lastSensorState = reading;
+    // save the gasSensorReading. Next time through the loop, it'll be the lastGasSensorState:
+    //lastGasSensorState = gasSensorReading;
+
+    //sleep(1000);
   }
 }
